@@ -1,0 +1,29 @@
+{
+  "name": "linear",
+  "entrypoint": "index.ts",
+  "version": "0.1.0",
+  "description": "Linear integration. List/search/create/update issues, add comments, manage teams.",
+  "config": [
+    {
+      "name": "api_key",
+      "type": "string",
+      "description": "Linear API key (personal or OAuth token)",
+      "required": true,
+      "env_var": "LINEAR_API_KEY",
+      "secret": true
+    },
+    {
+      "name": "team_id",
+      "type": "string",
+      "description": "Default Linear team ID (required for creating issues)",
+      "required": false
+    },
+    {
+      "name": "base_url",
+      "type": "string",
+      "description": "Linear GraphQL API base URL",
+      "required": false,
+      "default": "https://api.linear.app/graphql"
+    }
+  ]
+}
