@@ -25,6 +25,8 @@ interface LinearConfig {
 	webhook_path?: string;
 	webhook_secret?: string;
 	webhook_agent?: string;
+	bot_user_id?: string;
+	mention_trigger?: string;
 }
 
 // ── Types ──────────────────────────────────────────────────────
@@ -85,14 +87,15 @@ interface LinearComment {
 
 // ── Webhook types ──────────────────────────────────────────────
 
-interface AgentSessionEvent {
-	type: "created" | "updated" | "completed";
-	agentSession: {
-		id: string;
-		issue: { id: string; identifier: string; title: string; description?: string };
-		comment?: { id: string; body: string };
-		promptContext?: string;
-	};
+/** Actual Linear webhook payload shape */
+interface LinearWebhookPayload {
+	action: "create" | "update" | "delete" | "remove";
+	type: "Comment" | "Issue" | "Project" | string;
+	data: Record<string, unknown>;
+	actor: { id: string; name: string; email?: string; displayName?: string };
+	url?: string;
+	createdAt: string;
+	updatedFrom?: Record<string, unknown>;
 }
 
 // ── GraphQL helpers ────────────────────────────────────────────
@@ -916,9 +919,9 @@ async function handleWebhook(
 	logger: Logger,
 ): Promise<Response> {
 	const body = await req.text();
+	const cfg = ctx.config as unknown as LinearConfig;
 
 	// Verify HMAC signature if secret is configured
-	const cfg = ctx.config as unknown as LinearConfig;
 	if (cfg.webhook_secret) {
 		const signature = req.headers.get("linear-signature") ?? req.headers.get("X-Linear-Signature") ?? "";
 		if (!signature) {
@@ -931,38 +934,120 @@ async function handleWebhook(
 		}
 	}
 
-	let event: AgentSessionEvent;
+	let payload: LinearWebhookPayload;
 	try {
-		event = JSON.parse(body) as AgentSessionEvent;
+		payload = JSON.parse(body) as LinearWebhookPayload;
 	} catch {
 		logger.warn("webhook body is not valid JSON");
 		return new Response("invalid JSON", { status: 400 });
 	}
 
-	const { type, agentSession } = event;
-	if (!agentSession?.issue?.id) {
-		logger.warn("webhook missing agentSession.issue.id");
+	// Only react to new comments
+	if (payload.type !== "Comment" || payload.action !== "create") {
+		logger.debug({ type: payload.type, action: payload.action }, "ignoring non-comment-create webhook");
+		return new Response("ok", { status: 200 });
+	}
+
+	// Prevent infinite loops: ignore comments from the bot itself
+	if (cfg.bot_user_id && payload.actor?.id === cfg.bot_user_id) {
+		logger.debug({ actorId: payload.actor?.id }, "ignoring bot's own comment");
+		return new Response("ok", { status: 200 });
+	}
+
+	const commentData = payload.data as {
+		id: string;
+		body: string;
+		issueId?: string;
+		issue?: { id: string; identifier?: string };
+	};
+
+	const issueId = commentData.issueId ?? commentData.issue?.id;
+	if (!issueId) {
+		logger.warn("webhook comment has no issueId");
 		return new Response("missing issue id", { status: 400 });
 	}
 
-	const issueId = agentSession.issue.id;
-	const issueIdentifier = agentSession.issue.identifier;
+	// Check mention trigger (default: @bot)
+	const mentionTrigger = cfg.mention_trigger || "@bot";
+	const commentBody = commentData.body || "";
+	if (!commentBody.toLowerCase().includes(mentionTrigger.toLowerCase())) {
+		logger.debug({ mentionTrigger }, "comment does not mention bot, ignoring");
+		return new Response("ok", { status: 200 });
+	}
 
-	// Build the prompt for the agent
+	// Build API client to fetch full context
+	const baseUrl = cfg.base_url || "https://api.linear.app/graphql";
+	const client = new LinearClient(cfg.api_key, baseUrl, logger);
+
+	// Fetch full issue details
+	let issue: LinearIssue;
+	try {
+		const issueResult = await client.query<{ issue: LinearIssue }>(`
+			${ISSUE_FIELDS}
+			query GetIssue {
+				issue(id: "${issueId}") { ...IssueFields }
+			}
+		`);
+		if (!issueResult.issue) throw new Error("issue not found");
+		issue = issueResult.issue;
+	} catch (err) {
+		logger.error({ err, issueId }, "failed to fetch issue for webhook");
+		return new Response("internal error", { status: 500 });
+	}
+
+	// Fetch all comments on the issue
+	let comments: LinearComment[] = [];
+	try {
+		const commentResult = await client.query<{
+			issue: { comments: { nodes: LinearComment[] } };
+		}>(`
+			query IssueComments {
+				issue(id: "${issueId}") {
+					comments(first: 100) {
+						nodes {
+							id body createdAt
+							user { id name displayName avatarUrl }
+						}
+					}
+				}
+			}
+		`);
+		comments = commentResult.issue?.comments?.nodes ?? [];
+	} catch (err) {
+		logger.error({ err, issueId }, "failed to fetch comments for webhook");
+	}
+
+	// Build rich prompt with full context
 	const promptParts: string[] = [];
+	promptParts.push(`You were @mentioned on a Linear issue. Here is the full context:\n`);
+	promptParts.push(`--- ISSUE ---`);
+	promptParts.push(`Identifier: ${issue.identifier}`);
+	promptParts.push(`Title: ${issue.title}`);
+	if (issue.state) promptParts.push(`Status: ${issue.state.name}`);
+	promptParts.push(`Priority: ${priorityLabel(issue.priority)}`);
+	if (issue.assignee) promptParts.push(`Assignee: ${issue.assignee.displayName || issue.assignee.name}`);
+	if (issue.creator) promptParts.push(`Creator: ${issue.creator.displayName || issue.creator.name}`);
+	if (issue.labels?.nodes?.length) {
+		promptParts.push(`Labels: ${issue.labels.nodes.map((l) => l.name).join(", ")}`);
+	}
+	if (issue.dueDate) promptParts.push(`Due: ${issue.dueDate}`);
+	if (issue.description) {
+		promptParts.push(`\nDescription:\n${issue.description}`);
+	}
 
-	if (agentSession.promptContext) {
-		promptParts.push(agentSession.promptContext);
-	} else {
-		// Fallback: construct from issue + comment
-		promptParts.push(`You were mentioned on Linear issue ${issueIdentifier}: ${agentSession.issue.title}`);
-		if (agentSession.issue.description) {
-			promptParts.push(`\nDescription:\n${agentSession.issue.description}`);
-		}
-		if (agentSession.comment) {
-			promptParts.push(`\nComment:\n${agentSession.comment.body}`);
+	if (comments.length > 0) {
+		promptParts.push(`\n--- COMMENTS (${comments.length}) ---`);
+		for (const c of comments) {
+			const author = c.user?.displayName || c.user?.name || "Unknown";
+			promptParts.push(`[${author}]: ${c.body}`);
 		}
 	}
+
+	// The triggering comment (mention)
+	promptParts.push(`\n--- TRIGGER ---`);
+	promptParts.push(`${payload.actor?.displayName || payload.actor?.name} mentioned you: ${commentBody}`);
+
+	promptParts.push(`\nRespond to this comment using the linear_create_comment tool with issue_id "${issue.identifier}".`);
 
 	const prompt = promptParts.join("\n");
 
@@ -970,8 +1055,10 @@ async function handleWebhook(
 	const metadata: Record<string, unknown> = {
 		source: "linear",
 		issueId,
-		issueIdentifier,
-		sessionType: type,
+		issueIdentifier: issue.identifier,
+		triggerCommentId: commentData.id,
+		actorId: payload.actor?.id,
+		actorName: payload.actor?.displayName || payload.actor?.name,
 	};
 
 	if (cfg.webhook_agent) {
@@ -979,24 +1066,17 @@ async function handleWebhook(
 	}
 
 	try {
-		if (type === "created") {
-			// New session for this issue
-			await ctx.createSession("linear", issueId, prompt, metadata);
-			logger.info({ issueId, issueIdentifier, type }, "created session from linear webhook");
+		// Try to continue existing session for this issue
+		const session = await ctx.sessions.getBySource("linear", issueId);
+		if (session) {
+			await ctx.continueSession(session.id, prompt, metadata);
+			logger.info({ issueId, identifier: issue.identifier, sessionId: session.id }, "continued session from linear webhook");
 		} else {
-			// Follow-up: continue existing session
-			const session = await ctx.sessions.getBySource("linear", issueId);
-			if (session) {
-				await ctx.continueSession(session.id, prompt, metadata);
-				logger.info({ issueId, issueIdentifier, type, sessionId: session.id }, "continued session from linear webhook");
-			} else {
-				// No existing session — create one
-				await ctx.createSession("linear", issueId, prompt, metadata);
-				logger.info({ issueId, issueIdentifier, type }, "created new session (no existing) from linear webhook");
-			}
+			await ctx.createSession("linear", issueId, prompt, metadata);
+			logger.info({ issueId, identifier: issue.identifier }, "created session from linear webhook");
 		}
 	} catch (err) {
-		logger.error({ err, issueId, type }, "failed to create/continue session from webhook");
+		logger.error({ err, issueId }, "failed to create/continue session from webhook");
 		return new Response("internal error", { status: 500 });
 	}
 

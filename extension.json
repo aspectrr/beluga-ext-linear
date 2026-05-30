@@ -52,6 +52,19 @@
       "type": "string",
       "description": "Default agent name to route webhook sessions to (overrides routing)",
       "required": false
+    },
+    {
+      "name": "bot_user_id",
+      "type": "string",
+      "description": "Linear user ID of the bot account. Prevents infinite webhook loops by ignoring the bot's own comments.",
+      "required": false
+    },
+    {
+      "name": "mention_trigger",
+      "type": "string",
+      "description": "String that must appear in a comment to trigger the bot (default: @bot)",
+      "required": false,
+      "default": "@bot"
     }
   ]
 }
