@@ -1,9 +1,9 @@
 {
   "name": "@beluga/ext-linear",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "index.ts",
-  "description": "Linear integration for Beluga. List/search/create/update issues, add comments, manage teams.",
+  "description": "Linear integration for Beluga. List/search/create/update issues, add comments, manage teams. Optional webhook listener for agent session events.",
   "dependencies": {
     "@aspectrr/beluga-sdk": "^0.1.1"
   },

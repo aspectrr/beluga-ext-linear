@@ -1,8 +1,8 @@
 {
   "name": "linear",
   "entrypoint": "index.ts",
-  "version": "0.1.0",
-  "description": "Linear integration. List/search/create/update issues, add comments, manage teams.",
+  "version": "0.2.0",
+  "description": "Linear integration. List/search/create/update issues, add comments, manage teams. Optional webhook listener for agent session events.",
   "config": [
     {
       "name": "api_key",
@@ -24,6 +24,34 @@
       "description": "Linear GraphQL API base URL",
       "required": false,
       "default": "https://api.linear.app/graphql"
+    },
+    {
+      "name": "webhook_port",
+      "type": "integer",
+      "description": "Port for Linear webhook listener. Enables webhook mode when set.",
+      "required": false,
+      "default": "3099"
+    },
+    {
+      "name": "webhook_path",
+      "type": "string",
+      "description": "URL path for webhook endpoint (default: /linear/webhook)",
+      "required": false,
+      "default": "/linear/webhook"
+    },
+    {
+      "name": "webhook_secret",
+      "type": "string",
+      "description": "Linear webhook signing secret for HMAC verification",
+      "required": false,
+      "env_var": "LINEAR_WEBHOOK_SECRET",
+      "secret": true
+    },
+    {
+      "name": "webhook_agent",
+      "type": "string",
+      "description": "Default agent name to route webhook sessions to (overrides routing)",
+      "required": false
     }
   ]
 }

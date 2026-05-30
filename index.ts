@@ -1,7 +1,8 @@
 // ── Linear Extension ──────────────────────────────────────────
 // Linear integration for Beluga. Uses Linear's GraphQL API to
 // list/search/create/update issues, add comments, and list teams.
-// 7 tools registered.
+// Optional webhook listener for Linear agent session events.
+// 7 tools + webhook ingress.
 
 import type {
 	Extension,
@@ -11,6 +12,7 @@ import type {
 	ToolContext,
 } from "@aspectrr/beluga-sdk";
 import type { Logger } from "pino";
+import { createHmac, timingSafeEqual } from "crypto";
 
 // ── Config ─────────────────────────────────────────────────────
 
@@ -19,6 +21,10 @@ interface LinearConfig {
 	api_key: string;
 	team_id?: string;
 	base_url?: string;
+	webhook_port?: number;
+	webhook_path?: string;
+	webhook_secret?: string;
+	webhook_agent?: string;
 }
 
 // ── Types ──────────────────────────────────────────────────────
@@ -77,6 +83,18 @@ interface LinearComment {
 	user?: LinearUser;
 }
 
+// ── Webhook types ──────────────────────────────────────────────
+
+interface AgentSessionEvent {
+	type: "created" | "updated" | "completed";
+	agentSession: {
+		id: string;
+		issue: { id: string; identifier: string; title: string; description?: string };
+		comment?: { id: string; body: string };
+		promptContext?: string;
+	};
+}
+
 // ── GraphQL helpers ────────────────────────────────────────────
 
 interface GQLResponse<T> {
@@ -108,6 +126,24 @@ function priorityLabel(num: number | undefined | null): string {
 		4: "Low",
 	};
 	return map[num ?? 0] ?? "No priority";
+}
+
+// ── HMAC verification ─────────────────────────────────────────
+
+function verifySignature(
+	body: string,
+	signature: string,
+	secret: string,
+): boolean {
+	const expected = createHmac("sha256", secret).update(body).digest("hex");
+	try {
+		return timingSafeEqual(
+			Buffer.from(signature, "hex"),
+			Buffer.from(expected, "hex"),
+		);
+	} catch {
+		return false;
+	}
 }
 
 // ── Linear API Client ──────────────────────────────────────────
@@ -788,6 +824,12 @@ class LinearExtension implements Extension {
 	name = "linear";
 	private client?: LinearClient;
 	private defaultTeamId?: string;
+	private ctx?: ExtensionContext;
+	private webhookPort?: number;
+	private webhookPath: string = "/linear/webhook";
+	private webhookSecret?: string;
+	private webhookAgent?: string;
+	private server?: { stop(): void };
 
 	async init(ctx: ExtensionContext): Promise<void> {
 		const cfg = ctx.config as unknown as LinearConfig;
@@ -799,6 +841,13 @@ class LinearExtension implements Extension {
 		const baseUrl = cfg.base_url || "https://api.linear.app/graphql";
 		this.client = new LinearClient(cfg.api_key, baseUrl, ctx.logger);
 		this.defaultTeamId = cfg.team_id;
+		this.ctx = ctx;
+
+		// Webhook config
+		this.webhookPort = cfg.webhook_port;
+		this.webhookPath = cfg.webhook_path || "/linear/webhook";
+		this.webhookSecret = cfg.webhook_secret;
+		this.webhookAgent = cfg.webhook_agent;
 
 		ctx.registry.register(new ListTeamsTool(this.client));
 		ctx.registry.register(new ListIssuesTool(this.client, this.defaultTeamId));
@@ -811,13 +860,147 @@ class LinearExtension implements Extension {
 		ctx.logger.info("linear extension initialized");
 	}
 
-	async start(_signal: AbortSignal): Promise<void> {
-		// No background work needed
+	async start(signal: AbortSignal): Promise<void> {
+		if (!this.webhookPort || !this.ctx) return;
+
+		const logger = this.ctx.logger;
+		const ctx = this.ctx;
+
+		const webhookPath = this.webhookPath;
+
+		const server = Bun.serve({
+			port: this.webhookPort,
+			async fetch(req: Request): Promise<Response> {
+				const url = new URL(req.url);
+
+				// Health check
+				if (url.pathname === "/health" && req.method === "GET") {
+					return new Response("ok", { status: 200 });
+				}
+
+				// Webhook endpoint
+				if (url.pathname === webhookPath && req.method === "POST") {
+					return handleWebhook(req, ctx, logger);
+				}
+
+				return new Response("not found", { status: 404 });
+			},
+		});
+
+		this.server = server;
+
+		logger.info(
+			{ port: this.webhookPort, path: this.webhookPath },
+			"linear webhook listener started",
+		);
+
+		signal.addEventListener("abort", () => {
+			server.stop();
+			logger.info("linear webhook listener stopped");
+		});
 	}
 
 	async stop(): Promise<void> {
-		// No resources to clean up
+		if (this.server) {
+			this.server.stop();
+			this.ctx?.logger.info("linear webhook listener stopped");
+		}
 	}
+}
+
+// ── Webhook handler ────────────────────────────────────────────
+
+async function handleWebhook(
+	req: Request,
+	ctx: ExtensionContext,
+	logger: Logger,
+): Promise<Response> {
+	const body = await req.text();
+
+	// Verify HMAC signature if secret is configured
+	const cfg = ctx.config as unknown as LinearConfig;
+	if (cfg.webhook_secret) {
+		const signature = req.headers.get("linear-signature") ?? req.headers.get("X-Linear-Signature") ?? "";
+		if (!signature) {
+			logger.warn("webhook missing signature header");
+			return new Response("missing signature", { status: 401 });
+		}
+		if (!verifySignature(body, signature, cfg.webhook_secret)) {
+			logger.warn("webhook signature verification failed");
+			return new Response("invalid signature", { status: 401 });
+		}
+	}
+
+	let event: AgentSessionEvent;
+	try {
+		event = JSON.parse(body) as AgentSessionEvent;
+	} catch {
+		logger.warn("webhook body is not valid JSON");
+		return new Response("invalid JSON", { status: 400 });
+	}
+
+	const { type, agentSession } = event;
+	if (!agentSession?.issue?.id) {
+		logger.warn("webhook missing agentSession.issue.id");
+		return new Response("missing issue id", { status: 400 });
+	}
+
+	const issueId = agentSession.issue.id;
+	const issueIdentifier = agentSession.issue.identifier;
+
+	// Build the prompt for the agent
+	const promptParts: string[] = [];
+
+	if (agentSession.promptContext) {
+		promptParts.push(agentSession.promptContext);
+	} else {
+		// Fallback: construct from issue + comment
+		promptParts.push(`You were mentioned on Linear issue ${issueIdentifier}: ${agentSession.issue.title}`);
+		if (agentSession.issue.description) {
+			promptParts.push(`\nDescription:\n${agentSession.issue.description}`);
+		}
+		if (agentSession.comment) {
+			promptParts.push(`\nComment:\n${agentSession.comment.body}`);
+		}
+	}
+
+	const prompt = promptParts.join("\n");
+
+	// Metadata for routing
+	const metadata: Record<string, unknown> = {
+		source: "linear",
+		issueId,
+		issueIdentifier,
+		sessionType: type,
+	};
+
+	if (cfg.webhook_agent) {
+		metadata.agent = cfg.webhook_agent;
+	}
+
+	try {
+		if (type === "created") {
+			// New session for this issue
+			await ctx.createSession("linear", issueId, prompt, metadata);
+			logger.info({ issueId, issueIdentifier, type }, "created session from linear webhook");
+		} else {
+			// Follow-up: continue existing session
+			const session = await ctx.sessions.getBySource("linear", issueId);
+			if (session) {
+				await ctx.continueSession(session.id, prompt, metadata);
+				logger.info({ issueId, issueIdentifier, type, sessionId: session.id }, "continued session from linear webhook");
+			} else {
+				// No existing session — create one
+				await ctx.createSession("linear", issueId, prompt, metadata);
+				logger.info({ issueId, issueIdentifier, type }, "created new session (no existing) from linear webhook");
+			}
+		}
+	} catch (err) {
+		logger.error({ err, issueId, type }, "failed to create/continue session from webhook");
+		return new Response("internal error", { status: 500 });
+	}
+
+	return new Response("ok", { status: 200 });
 }
 
 export default new LinearExtension();
